@@ -1,0 +1,6 @@
+# Tools for testing the Vigil toolchain itself.
+
+# Calls a helper that does not exist, so that the kernel verifier rejects
+# the program at this line. Used to test how verifier errors are reported.
+@helper(2147483647)
+def verifier_reject(): ...

@@ -1,0 +1,180 @@
+# Inference with small models, over integers or fixed-point numbers
+# (`std.fixed`). Weights usually live in an `Array` map, so userspace can
+# replace a model while the program runs.
+from std.ml.tensor import Vector, Matrix
+
+# A model that assigns a class to its input `In` (a `Vector[T, N]` for the
+# models of this module).
+protocol Classifier[In]:
+    def classify(self, x: In) -> usize: ...
+
+# An affine layer: `W x + b`.
+struct Linear[T, IN: usize, OUT: usize](Classifier[Vector[T, IN]]):
+    weights: Matrix[T, OUT, IN]
+    bias: Vector[T, OUT]
+
+    def forward(self, x: Vector[T, IN]) -> Vector[T, OUT]:
+        return self.weights.matvec(x) + self.bias
+
+    # The class of the largest output (multinomial logistic regression).
+    def classify(self, x: Vector[T, IN]) -> usize:
+        return self.forward(x).argmax()
+
+# A multilayer perceptron with one hidden layer and ReLU activations.
+struct Mlp[T, IN: usize, HID: usize, OUT: usize](Classifier[Vector[T, IN]]):
+    hidden: Linear[T, IN, HID]
+    output: Linear[T, HID, OUT]
+
+    def forward(self, x: Vector[T, IN]) -> Vector[T, OUT]:
+        h = self.hidden.forward(x).relu()
+        return self.output.forward(h)
+
+    def classify(self, x: Vector[T, IN]) -> usize:
+        return self.forward(x).argmax()
+
+# A binary linear classifier that learns online.
+struct Perceptron[T, N: usize](Classifier[Vector[T, N]]):
+    weights: Vector[T, N]
+    bias: T
+
+    def score(self, x: Vector[T, N]) -> T:
+        return self.weights.dot(x) + self.bias
+
+    # 1 if the score is positive, else 0.
+    def classify(self, x: Vector[T, N]) -> usize:
+        s = self.score(x)
+        if s > s - s:
+            return 1
+        return 0
+
+    # The perceptron rule: on a mistake, moves the weights towards the
+    # right answer by `rate`.
+    @mut
+    def learn(self, x: Vector[T, N], label: usize, rate: T):
+        predicted = self.classify(x)
+        if predicted == label:
+            return
+        step = rate
+        if label == 0:
+            step = rate - rate - rate
+        self.weights = self.weights + x.scale(step)
+        self.bias = self.bias + step
+
+# The nearest of K centroids (k-means inference).
+struct Centroids[T, K: usize, N: usize](Classifier[Vector[T, N]]):
+    points: Matrix[T, K, N]
+
+    def classify(self, x: Vector[T, N]) -> usize:
+        best: usize = 0
+        best_d = self.points.row(0).distance2(x)
+        for k in range(1, K):
+            d = self.points.row(k).distance2(x)
+            if d < best_d:
+                best = k
+                best_d = d
+        return best
+
+    # Moves the nearest centroid towards `x` by `rate` (online k-means).
+    @mut
+    def learn(self, x: Vector[T, N], rate: T) -> usize:
+        k = self.classify(x)
+        c = self.points.row(k)
+        moved = c + (x - c).scale(rate)
+        self.points.rows[k] = moved.items
+        return k
+
+# A node of a decision tree: an internal node sends `x` left when
+# `x[feature] <= threshold`; a leaf (`feature == LEAF`, or any feature the
+# vectors do not have) has a label.
+struct TreeNode[T]:
+    feature: u8
+    threshold: T
+    left: u16
+    right: u16
+    label: u16
+
+const LEAF: u8 = 255
+
+# A decision tree stored as a table of N nodes (the root is node 0), of
+# depth at most DEPTH, as in Planter and pForest.
+#
+# The table comes from user space (a map): whatever it holds, the walk
+# stays in it. A feature out of the F of the vectors makes a leaf, and a
+# child out of the N nodes ends the walk at its parent, whose label is
+# the class: a malformed model gives some class instead of aborting the
+# program (`vigil verify --all --std` proves no index can fail).
+struct DecisionTree[T, F: usize, N: usize, DEPTH: usize](Classifier[Vector[T, F]]):
+    nodes: TreeNode[T][N]
+
+    def classify(self, x: Vector[T, F]) -> usize:
+        if N == 0:
+            return 0
+        i: u16 = 0
+        for _ in range(DEPTH):
+            node = self.nodes[i]
+            if usize(node.feature) >= F:
+                return usize(node.label)
+            next: u16 = node.right
+            if x.items[node.feature] <= node.threshold:
+                next = node.left
+            if usize(next) >= N:
+                return usize(node.label)
+            i = next
+        return usize(self.nodes[i].label)
+
+# A random forest: TREES trees of the same shape vote, and the class with
+# the most votes wins (the first one on ties), as in Planter and pForest.
+struct RandomForest[
+    T,
+    F: usize,
+    N: usize,
+    DEPTH: usize,
+    TREES: usize,
+    CLASSES: usize,
+](Classifier[Vector[T, F]]):
+    trees: DecisionTree[T, F, N, DEPTH][TREES]
+
+    # The votes for each class.
+    def votes(self, x: Vector[T, F]) -> Vector[u32, CLASSES]:
+        votes: u32[CLASSES] = [0] * CLASSES
+        for t in range(TREES):
+            c = self.trees[t].classify(x)
+            if c < CLASSES:
+                votes[c] += 1
+        return Vector[u32, CLASSES](votes)
+
+    def classify(self, x: Vector[T, F]) -> usize:
+        return self.votes(x).argmax()
+
+# The K nearest of N labelled points vote, by squared Euclidean distance
+# (earlier points first on ties). The K nearest so far are kept sorted, and
+# each point is inserted among them: the verifier walks one loop over the
+# points, with a few paths per point.
+struct Knn[T, F: usize, N: usize, K: usize, CLASSES: usize](Classifier[Vector[T, F]]):
+    points: Matrix[T, N, F]
+    labels: u16[N]
+
+    def classify(self, x: Vector[T, F]) -> usize:
+        nearest = [x.items[0] - x.items[0]] * K
+        nearest_labels: u16[K] = [0] * K
+        count: usize = 0
+        for i in range(N):
+            d = self.points.row(i).distance2(x)
+            label = self.labels[i]
+            # Where it goes, the farther ones moving down.
+            @unroll
+            for slot in range(K):
+                if slot >= count or d < nearest[slot]:
+                    farther = nearest[slot]
+                    farther_label = nearest_labels[slot]
+                    nearest[slot] = d
+                    nearest_labels[slot] = label
+                    d = farther
+                    label = farther_label
+            count = min(count + 1, K)
+        votes: u32[CLASSES] = [0] * CLASSES
+        for slot in range(K):
+            l = usize(nearest_labels[slot])
+            if slot < count and l < CLASSES:
+                votes[l] += 1
+        return Vector[u32, CLASSES](votes).argmax()

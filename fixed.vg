@@ -1,0 +1,201 @@
+# Fixed-point numbers, the arithmetic of machine learning in eBPF (the
+# verifier rejects floating point).
+#
+# `fixed[I, F]` has I integer bits (sign included) and F fractional bits:
+# its value is `raw / 2^F`. I + F is at most 32. Every operation saturates
+# at the bounds of the type instead of wrapping, as quantized models expect,
+# with `clamp`, which has no branches: a layer of a model has hundreds of
+# operations, and each branch would double the paths the verifier explores.
+#
+# The contracts state what `vigil verify --std` proves for the instances a
+# project uses: each operation is the exact result saturated to the range
+# of the type, which they keep (`valid`), with the properties quantized
+# models rely on.
+
+struct fixed[I: usize, F: usize]:
+    raw: i32
+
+    # Whether the raw value is in the range of the type: the values the
+    # operations build always are.
+    def valid(self) -> bool:
+        return i64(self.raw) >= -(1 << (I + F - 1)) and i64(self.raw) <= (1 << (I + F - 1)) - 1
+
+    # Constructors.
+
+    @ensures(result.raw == 0)
+    def zero() -> fixed[I, F]:
+        return fixed[I, F](0)
+
+    # 1, saturated when the type has no integer bit besides the sign.
+    @ensures(I == 1 or i64(result.raw) == 1 << F)
+    def one() -> fixed[I, F]:
+        return fixed[I, F].from_raw(1 << F)
+
+    # The value `raw / 2^F`, saturated.
+    @ensures(i64(result.raw) == clamp(raw, -(1 << (I + F - 1)), (1 << (I + F - 1)) - 1))
+    @ensures(result.valid())
+    def from_raw(raw: i64) -> fixed[I, F]:
+        hi: i64 = (1 << (I + F - 1)) - 1
+        lo: i64 = -hi - 1
+        return fixed[I, F](i32(clamp(raw, lo, hi)))
+
+    # An integer of the range is exact.
+    @ensures(result.valid())
+    @ensures(value >= 1 << (I - 1) or value < -(1 << (I - 1)) or result.to_int() == value)
+    @ensures(value < 0 or result.raw >= 0)
+    def from_int(value: i64) -> fixed[I, F]:
+        # Beyond 2^31 the result saturates anyway; 2^31 << F fits (F < 32).
+        bound: i64 = 1 << 31
+        return fixed[I, F].from_raw(clamp(value, -bound, bound) << F)
+
+    # An unsigned counter, saturated (packets, bytes, durations).
+    @ensures(result.valid() and result.raw >= 0)
+    def saturate(value: u64) -> fixed[I, F]:
+        return fixed[I, F].from_int(i64(clamp(value, 0, 1 << 32)))
+
+    # `num / den`, truncated toward 0 and saturated; 0 if `den` is 0. Exact
+    # for every `num` and `den` (`num << F` would overflow): the integer
+    # part and the remainder of the magnitudes, then F bits of the fraction
+    # by long division, without branches in the loop (each would double
+    # the paths the verifier explores).
+    @ensures(result.valid())
+    @ensures(den != 0 or result.raw == 0)
+    @ensures(num < 0 or den <= 0 or result.raw >= 0)
+    @ensures(den != 1 or result == fixed[I, F].from_int(num))
+    def from_ratio(num: i64, den: i64) -> fixed[I, F]:
+        if den == 0:
+            return fixed[I, F](0)
+        # The magnitudes, in u64 (that of the smallest i64 is 2^63).
+        n: u64 = u64(num)
+        if num < 0:
+            n = 0 - n
+        d: u64 = u64(den)
+        if den < 0:
+            d = 0 - d
+        # Beyond 2^31 the result saturates anyway; 2^31 << F fits.
+        whole: u64 = min(n // d, 1 << 31)
+        rem: u64 = n % d
+        frac: u64 = 0
+        for i in range(F):
+            # rem < d <= 2^63, so 2 rem fits; `take` is 1 when d fits in it
+            # (no borrow in rem - d, Hacker's Delight 2-13).
+            rem = rem << 1
+            diff: u64 = rem - d
+            borrow: u64 = ((~rem & d) | ((~rem | d) & diff)) >> 63
+            take: u64 = 1 - borrow
+            rem = rem - (d & (0 - take))
+            frac = (frac << 1) | take
+        magnitude: i64 = i64((whole << F) | frac)
+        # Negated when the signs differ: all ones in `negative` then, and
+        # `(m ^ -1) - -1` is `-m`.
+        negative: i64 = (num ^ den) >> 63
+        return fixed[I, F].from_raw((magnitude ^ negative) - negative)
+
+    # Conversions.
+
+    # The integer part, rounded down.
+    @ensures(result << F <= i64(self.raw) and i64(self.raw) < (result + 1) << F)
+    def to_int(self) -> i64:
+        return i64(self.raw) >> F
+
+    # The raw value: the number times 2^F.
+    @ensures(result == i64(self.raw))
+    def to_raw(self) -> i64:
+        return i64(self.raw)
+
+    # Operators.
+
+    @ensures(result == fixed[I, F].from_raw(i64(self.raw) + i64(other.raw)))
+    @ensures(result.valid())
+    @ensures(not (self.valid() and other.valid()) or other.raw < 0 or result.raw >= self.raw)
+    def __add__(self, other: fixed[I, F]) -> fixed[I, F]:
+        return fixed[I, F].from_raw(i64(self.raw) + i64(other.raw))
+
+    @ensures(result == fixed[I, F].from_raw(i64(self.raw) - i64(other.raw)))
+    @ensures(result.valid())
+    @ensures(not (self.valid() and other.valid()) or other.raw > 0 or result.raw >= self.raw)
+    def __sub__(self, other: fixed[I, F]) -> fixed[I, F]:
+        return fixed[I, F].from_raw(i64(self.raw) - i64(other.raw))
+
+    @ensures(result == fixed[I, F].from_raw((i64(self.raw) * i64(other.raw)) >> F))
+    @ensures(result.valid())
+    @ensures((self.raw >= 0) != (other.raw >= 0) or result.raw >= 0)
+    @ensures(not self.valid() or i64(other.raw) != 1 << F or result.raw == self.raw)
+    # A factor between 0 and 1 does not increase a value.
+    @ensures(self.raw < 0 or other.raw < 0 or i64(other.raw) > 1 << F or result.raw <= self.raw)
+    def __mul__(self, other: fixed[I, F]) -> fixed[I, F]:
+        return fixed[I, F].from_raw((i64(self.raw) * i64(other.raw)) >> F)
+
+    # Division; 0 if `other` is 0.
+    @ensures(result == fixed[I, F].from_raw((i64(self.raw) << F) // i64(other.raw)))
+    @ensures(result.valid())
+    @ensures(other.raw != 0 or result.raw == 0)
+    @ensures(not self.valid() or i64(other.raw) != 1 << F or result.raw == self.raw)
+    @ensures((self.raw >= 0) != (other.raw > 0) or result.raw >= 0)
+    def __truediv__(self, other: fixed[I, F]) -> fixed[I, F]:
+        return fixed[I, F].from_raw((i64(self.raw) << F) // i64(other.raw))
+
+    @ensures(result == fixed[I, F].from_raw(-i64(self.raw)))
+    @ensures(result.valid())
+    @ensures(
+        not self.valid() or i64(self.raw) == -(1 << (I + F - 1)) or i64(result.raw) == -i64(self.raw),
+    )
+    def __neg__(self) -> fixed[I, F]:
+        return fixed[I, F].from_raw(-i64(self.raw))
+
+    def __eq__(self, other: fixed[I, F]) -> bool:
+        return self.raw == other.raw
+
+    def __ne__(self, other: fixed[I, F]) -> bool:
+        return self.raw != other.raw
+
+    def __lt__(self, other: fixed[I, F]) -> bool:
+        return self.raw < other.raw
+
+    def __le__(self, other: fixed[I, F]) -> bool:
+        return self.raw <= other.raw
+
+    def __gt__(self, other: fixed[I, F]) -> bool:
+        return self.raw > other.raw
+
+    def __ge__(self, other: fixed[I, F]) -> bool:
+        return self.raw >= other.raw
+
+    # Functions.
+
+    @ensures(result.raw >= 0)
+    @ensures(not self.valid() or result.valid())
+    def abs(self) -> fixed[I, F]:
+        if self.raw < 0:
+            return -self
+        return self
+
+    @ensures(result.raw >= 0)
+    @ensures(self.raw < 0 or result.raw == self.raw)
+    def relu(self) -> fixed[I, F]:
+        return fixed[I, F](clamp(self.raw, 0, 0x7FFFFFFF))
+
+    # The product by an integer, saturated.
+    @ensures(result.valid())
+    @ensures(k < 0 or self.raw < 0 or result.raw >= 0)
+    def scale(self, k: i64) -> fixed[I, F]:
+        bound: i64 = 1 << 32
+        return fixed[I, F].from_raw(i64(self.raw) * clamp(k, -bound, bound))
+
+    # An exponentially weighted moving average: `self + alpha * (sample - self)`.
+    # With `alpha` between 0 and 1, the average stays between the two values.
+    @ensures(result.valid())
+    @ensures(
+        not (self.valid() and sample.valid()) or alpha.raw < 0 or i64(alpha.raw) > 1 << F or (min(self.raw, sample.raw) <= result.raw and result.raw <= max(self.raw, sample.raw)),
+    )
+    def ewma(self, sample: fixed[I, F], alpha: fixed[I, F]) -> fixed[I, F]:
+        return self + (sample - self) * alpha
+
+# The raw value of `x` with `frac` fractional bits, for comptime code that
+# quantizes weights and tables.
+comptime def quantize(x: f64, frac: u32) -> i64:
+    return i64(round(x * f64(1 << u64(frac))))
+
+type q8_8 = fixed[8, 8]
+type q16_16 = fixed[16, 16]
+type q4_12 = fixed[4, 12]

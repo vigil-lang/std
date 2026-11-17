@@ -1,0 +1,35 @@
+# The tests of the standard library: the compiler of `main`, built with
+# this library in it, runs its tests, which check that every module is
+# formatted and compile the examples that use the library.
+#
+# The compiler takes the library from `../std`, so the job lays the two
+# repositories out side by side: the compiler in `compiler/`, this one in
+# `std/`.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: std
+      - uses: actions/checkout@v4
+        with:
+          repository: vigil-lang/vigil
+          path: compiler
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang-18 && sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+      - working-directory: compiler
+        run: cargo test --workspace --locked

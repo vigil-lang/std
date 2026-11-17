@@ -1,0 +1,352 @@
+# Packets for the tests of programs.
+#
+# A `Packet` describes what a program sees in a packet: the addresses, the
+# protocols, the ports, the flags, the size of the payload. `vigil test`
+# generates them for properties, as any struct (shrinking makes them
+# simple: an IPv4 UDP packet with zero fields first), and turns them into
+# bytes that are coherent: lengths, header lengths and checksums are
+# computed, integers are in network order, options are NOPs, and the
+# payload is the bytes 0, 1, 2... A `Damaged` packet is such a packet with
+# one defect, to test how a program parses what it should not trust.
+
+# The largest Ethernet frame without its checksum: what `valid` allows.
+const MAX_FRAME: u32 = 1514
+
+struct Ethernet:
+    dst: bytes[6]
+    src: bytes[6]
+
+struct Ip4:
+    src: u32
+    dst: u32
+    ttl: u8
+    tos: u8
+    id: u16
+    dont_fragment: bool
+    options: u8             # 4-byte words of options, at most 10
+
+struct Ip6:
+    src: bytes[16]
+    dst: bytes[16]
+    hop_limit: u8
+    traffic_class: u8
+    flow: u32               # the flow label: its low 20 bits
+
+# TCP flags.
+const FIN: u8 = 0x01
+const SYN: u8 = 0x02
+const RST: u8 = 0x04
+const PSH: u8 = 0x08
+const ACK: u8 = 0x10
+const URG: u8 = 0x20
+
+struct Tcp:
+    sport: u16
+    dport: u16
+    seq: u32
+    ack: u32
+    flags: u8
+    window: u16
+    options: u8             # 4-byte words of options, at most 10
+
+struct Udp:
+    sport: u16
+    dport: u16
+
+# ICMP over IPv4, ICMPv6 over IPv6.
+struct Icmp:
+    kind: u8
+    code: u8
+    rest: u32               # the rest of the header: id and sequence of an echo
+
+enum Transport:
+    Udp(Udp)
+    Tcp(Tcp)
+    Icmp(Icmp)
+    Raw(u8)                 # another protocol number: the payload follows the IP header
+
+    # The length of the header, without options for `Raw`.
+    def header_len(self) -> u32:
+        match self:
+            case Transport.Udp(u):
+                return 8
+            case Transport.Tcp(t):
+                return 20 + 4 * u32(t.options)
+            case Transport.Icmp(i):
+                return 8
+            case Transport.Raw(n):
+                return 0
+
+    def sport(self) -> u16?:
+        match self:
+            case Transport.Udp(u):
+                return Some(u.sport)
+            case Transport.Tcp(t):
+                return Some(t.sport)
+            case _:
+                return None
+
+    def dport(self) -> u16?:
+        match self:
+            case Transport.Udp(u):
+                return Some(u.dport)
+            case Transport.Tcp(t):
+                return Some(t.dport)
+            case _:
+                return None
+
+# An ARP packet for IPv4 over Ethernet.
+struct Arp:
+    op: u16                 # 1 request, 2 reply
+    sender_mac: bytes[6]
+    sender_ip: u32
+    target_mac: bytes[6]
+    target_ip: u32
+
+enum Network:
+    Ipv4(Ip4, Transport)
+    Ipv6(Ip6, Transport)
+    Arp(Arp)
+    Raw(u16)                # another EtherType: the payload follows the Ethernet header
+
+struct Packet:
+    eth: Ethernet
+    net: Network
+    payload: u16            # bytes after the headers
+
+    # A UDP packet over IPv4, with zero MAC addresses, a TTL of 64 and no
+    # payload: for tests written by hand.
+    def udp4(src: u32, dst: u32, sport: u16, dport: u16) -> Packet:
+        eth = Ethernet([0] * 6, [0] * 6)
+        ip = Ip4(src, dst, 64, 0, 0, False, 0)
+        return Packet(eth, Network.Ipv4(ip, Transport.Udp(Udp(sport, dport))), 0)
+
+    # A TCP packet over IPv4 with these flags (`SYN`, `ACK`...), as `udp4`.
+    def tcp4(src: u32, dst: u32, sport: u16, dport: u16, flags: u8) -> Packet:
+        eth = Ethernet([0] * 6, [0] * 6)
+        ip = Ip4(src, dst, 64, 0, 0, False, 0)
+        tcp = Tcp(sport, dport, 0, 0, flags, 65535, 0)
+        return Packet(eth, Network.Ipv4(ip, Transport.Tcp(tcp)), 0)
+
+    def valid(self) -> bool:
+        match self.net:
+            case Network.Ipv4(ip, t):
+                if ip.options > 10:
+                    return False
+                match t:
+                    case Transport.Tcp(tcp):
+                        if tcp.options > 10:
+                            return False
+                    case _:
+                        pass
+            case Network.Ipv6(ip, t):
+                match t:
+                    case Transport.Tcp(tcp):
+                        if tcp.options > 10:
+                            return False
+                    case _:
+                        pass
+            case _:
+                pass
+        return u32(self.payload) <= MAX_FRAME and self.len() <= MAX_FRAME
+
+    # The length of the packet in bytes.
+    def len(self) -> u32:
+        size: u32 = 14 + u32(self.payload)
+        match self.net:
+            case Network.Ipv4(ip, t):
+                size += 20 + 4 * u32(ip.options) + t.header_len()
+            case Network.Ipv6(ip, t):
+                size += 40 + t.header_len()
+            case Network.Arp(a):
+                size += 28
+            case Network.Raw(n):
+                pass
+        return size
+
+    # The EtherType.
+    def ethertype(self) -> u16:
+        match self.net:
+            case Network.Ipv4(ip, t):
+                return 0x0800
+            case Network.Ipv6(ip, t):
+                return 0x86DD
+            case Network.Arp(a):
+                return 0x0806
+            case Network.Raw(n):
+                return n
+
+    def ipv4_src(self) -> u32?:
+        match self.net:
+            case Network.Ipv4(ip, t):
+                return Some(ip.src)
+            case _:
+                return None
+
+    def ipv4_dst(self) -> u32?:
+        match self.net:
+            case Network.Ipv4(ip, t):
+                return Some(ip.dst)
+            case _:
+                return None
+
+    # The transport protocol of an IP packet: its number in the IP header.
+    def protocol(self) -> u8?:
+        match self.net:
+            case Network.Ipv4(ip, t):
+                return Some(protocol_number(t, 1))
+            case Network.Ipv6(ip, t):
+                return Some(protocol_number(t, 58))
+            case _:
+                return None
+
+    def transport(self) -> Transport?:
+        match self.net:
+            case Network.Ipv4(ip, t):
+                return Some(t)
+            case Network.Ipv6(ip, t):
+                return Some(t)
+            case _:
+                return None
+
+    # (Written without `?`, which `@requires` filters cannot run yet.)
+    def sport(self) -> u16?:
+        match self.transport():
+            case Some(t):
+                return t.sport()
+            case None:
+                return None
+
+    def dport(self) -> u16?:
+        match self.transport():
+            case Some(t):
+                return t.dport()
+            case None:
+                return None
+
+def protocol_number(t: Transport, icmp: u8) -> u8:
+    match t:
+        case Transport.Udp(u):
+            return 17
+        case Transport.Tcp(tcp):
+            return 6
+        case Transport.Icmp(i):
+            return icmp
+        case Transport.Raw(n):
+            return n
+
+# What goes wrong in a `Damaged` packet. A defect of a header the packet
+# does not have changes nothing.
+enum Defect:
+    Truncated(u16)          # only the first n bytes (all, if there are fewer)
+    Version(u8)             # the IP version: its low 4 bits
+    HeaderLength(u8)        # the IPv4 header length, in words: its low 4 bits
+    TotalLength(u16)        # the IPv4 total length, or the IPv6 payload length
+    Checksum                # the IPv4 header checksum, inverted
+    DataOffset(u8)          # the TCP data offset, in words: its low 4 bits
+    UdpLength(u16)          # the UDP length
+
+struct Damaged:
+    packet: Packet
+    defect: Defect
+
+# A sequence of at most N values of T: its first `len` items. `vigil test`
+# draws the length first (short at first, longer over the cases), then
+# those items only, the others being their simplest value; shrinking
+# shortens the sequence and removes items from its middle.
+struct Trace[T, N: usize]:
+    len: u32
+    items: T[N]
+
+    # The item `i`, if the sequence has one.
+    def get(self, i: u32) -> T?:
+        if i < self.len and i < u32(N):
+            return Some(self.items[i])
+        return None
+
+# A pseudo-random generator (xorshift64*), for streams too long to draw as
+# a `Trace`: a property draws a seed and the parameters of a stream, and
+# makes its packets with an `Rng`; the same seed, the same stream, and
+# shrinking shrinks the seed and the parameters.
+struct Rng:
+    state: u64
+
+    # A generator for `seed` (mixed by splitmix64: distinct seeds give
+    # distinct streams, and the state is never 0).
+    def of(seed: u64) -> Rng:
+        z = seed + 0x9E3779B97F4A7C15
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+        z = z ^ (z >> 31)
+        if z == 0:
+            z = 1
+        return Rng(z)
+
+    @mut
+    def next(self) -> u64:
+        x = self.state
+        x = x ^ (x >> 12)
+        x = x ^ (x << 25)
+        x = x ^ (x >> 27)
+        self.state = x
+        return x * 0x2545F4914F6CDD1D
+
+    # A number in `0..n` (0 when `n` is 0).
+    @mut
+    def below(self, n: u64) -> u64:
+        if n == 0:
+            return 0
+        return self.next() % n
+
+    # True `per_mille` times in a thousand.
+    @mut
+    def chance(self, per_mille: u32) -> bool:
+        return self.below(1000) < u64(per_mille)
+
+    # A packet of the stream `mix` describes.
+    @mut
+    def packet(self, mix: Mix) -> Packet:
+        eth = Ethernet([0] * 6, [0] * 6)
+        if self.chance(mix.other):
+            arp = Arp(
+                1,
+                [0] * 6,
+                BACKGROUND + u32(self.below(u64(max(mix.sources, 1)))),
+                [0] * 6,
+                SERVERS,
+            )
+            return Packet(eth, Network.Arp(arp), 0)
+        src: u32 = 0
+        dst: u32 = 0
+        if self.chance(mix.attack):
+            src = u32(self.next() & 0xFFFFFFFF)
+            dst = VICTIMS + u32(self.below(u64(max(mix.victims, 1))))
+        else:
+            src = BACKGROUND + u32(self.below(u64(max(mix.sources, 1))))
+            dst = SERVERS + u32(self.below(u64(max(mix.destinations, 1))))
+        ip = Ip4(src, dst, 64, 0, 0, False, 0)
+        sport = u16(1024 + self.below(60000))
+        dport = u16(self.below(1024))
+        payload = u16(self.below(64))
+        if self.chance(500):
+            tcp = Tcp(sport, dport, 0, 0, ACK, 65535, 0)
+            return Packet(eth, Network.Ipv4(ip, Transport.Tcp(tcp)), payload)
+        return Packet(eth, Network.Ipv4(ip, Transport.Udp(Udp(sport, dport))), payload)
+
+# The addresses of streams: background sources from 10.0.0.0, the servers
+# they reach from 10.128.0.0, and the victims of a flood from 192.168.0.0.
+const BACKGROUND: u32 = 0x0A000000
+const SERVERS: u32 = 0x0A800000
+const VICTIMS: u32 = 0xC0A80000
+
+# A stream of IPv4 traffic, which `Rng.packet` draws packet by packet: a
+# background of UDP and TCP from `sources` addresses to `destinations`
+# addresses; `attack` packets in a thousand from spoofed sources (any
+# address) to `victims` addresses; `other` packets in a thousand that are
+# ARP, not IPv4.
+struct Mix:
+    sources: u32
+    destinations: u32
+    attack: u32
+    victims: u32
+    other: u32

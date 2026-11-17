@@ -1,0 +1,139 @@
+# Probabilistic summaries of packet streams, sized at compile time. They
+# usually live in maps (`PerCpuArray[CountMin[4, 1024], 1]`) and are
+# changed in place by their `@mut` methods.
+
+# Odd 32-bit seeds of the hash functions, from a linear congruential
+# generator run by the compiler.
+comptime def sketch_seeds() -> u32[8]:
+    seeds: u32[8] = [0] * 8
+    x: u64 = 0x2545F4914F6CDD1D
+    for i in range(8):
+        x = x * 6364136223846793005 + 1442695040888963407
+        seeds[i] = u32(x >> 32) | 1
+    return seeds
+
+const SEEDS: u32[8] = sketch_seeds()
+
+# A 32-bit hash of `x` for a seed (the finalizer of MurmurHash3).
+def hash32(x: u32, seed: u32) -> u32:
+    h = x ^ seed
+    h = h ^ (h >> 16)
+    h = h * 0x85EBCA6B
+    h = h ^ (h >> 13)
+    h = h * 0xC2B2AE35
+    return h ^ (h >> 16)
+
+# Count-min sketch: D rows (at most 8) of W counters (a power of two).
+# Estimates never undercount; they overcount by at most 2n/W with
+# probability 1 - 2^-D, after n additions.
+struct CountMin[D: usize, W: usize]:
+    counts: u32[W][D]
+
+    @mut
+    def add(self, key: u32):
+        self.add_n(key, 1)
+
+    # Adds `n` occurrences of `key`; counters saturate.
+    @mut
+    def add_n(self, key: u32, n: u32):
+        for d in range(D):
+            i = hash32(key, SEEDS[d]) & u32(W - 1)
+            self.counts[d][i] = saturating_add(self.counts[d][i], n)
+
+    # Adds one occurrence of `key` and returns its estimate: `add` then
+    # `estimate`, with the hashes computed once.
+    @mut
+    def add_estimate(self, key: u32) -> u32:
+        best: u32 = 0xFFFFFFFF
+        for d in range(D):
+            i = hash32(key, SEEDS[d]) & u32(W - 1)
+            count = saturating_add(self.counts[d][i], 1)
+            self.counts[d][i] = count
+            best = clamp(best, 0, count)
+        return best
+
+    # The estimated number of occurrences of `key`.
+    def estimate(self, key: u32) -> u32:
+        best: u32 = 0xFFFFFFFF
+        for d in range(D):
+            i = hash32(key, SEEDS[d]) & u32(W - 1)
+            # `min` without a branch.
+            best = clamp(best, 0, self.counts[d][i])
+        return best
+
+    @mut
+    def clear(self):
+        for d in range(D):
+            for i in range(W):
+                self.counts[d][i] = 0
+
+# Bloom filter: K hash functions (at most 8) over WORDS * 64 bits. No false
+# negatives; false positives become likely as it fills.
+struct Bloom[K: usize, WORDS: usize]:
+    bits: u64[WORDS]
+
+    @mut
+    def insert(self, key: u32):
+        for k in range(K):
+            bit = hash32(key, SEEDS[k]) % u32(WORDS * 64)
+            self.bits[bit // 64] = self.bits[bit // 64] | (1 << u64(bit % 64))
+
+    def contains(self, key: u32) -> bool:
+        for k in range(K):
+            bit = hash32(key, SEEDS[k]) % u32(WORDS * 64)
+            if self.bits[bit // 64] & (1 << u64(bit % 64)) == 0:
+                return False
+        return True
+
+# ln(k) in units of 2^-16, for k in 0..256 (0 for k = 0).
+comptime def ln_table() -> u32[257]:
+    table: u32[257] = [0] * 257
+    for k in range(1, 257):
+        table[k] = u32(round(log(f64(k)) * 65536.0))
+    return table
+
+const LN_Q16: u32[257] = ln_table()
+
+# HyperLogLog: the number of distinct keys, within about 1.04/sqrt(M), in M
+# one-byte registers (M a power of two, 16 to 256).
+struct HyperLogLog[M: usize]:
+    registers: u8[M]
+
+    @mut
+    def add(self, key: u32):
+        h = hash32(key, SEEDS[7])
+        index = h & u32(M - 1)
+        rest = h >> u32(bit_count(M - 1))
+        # The rank: the position of the lowest one bit of the rest.
+        lowest = u64(rest & (0 - rest))
+        rank = u8(min(bit_count(usize(lowest)), 33 - bit_count(M - 1)))
+        if rank > self.registers[index]:
+            self.registers[index] = rank
+
+    def estimate(self) -> u64:
+        # The harmonic mean of 2^register, in units of 2^-32.
+        total: u64 = 0
+        zeros: usize = 0
+        for r in self.registers:
+            total += u64(1) << (32 - u64(r))
+            # One for an empty register, without a branch: a branch on
+            # what iterations carry multiplies the paths the verifier
+            # walks, on kernels without `bpf_loop`.
+            zeros += usize((u64(r) - 1) >> 63)
+        # alpha_M, in units of 2^-16.
+        alpha = u64(47274) * u64(M) * 1000 // (1000 * u64(M) + 1079)
+        raw = alpha * u64(M) * u64(M) * 65536 // total
+        # Few keys: linear counting, M ln(M / zeros).
+        if raw <= 5 * u64(M) // 2 and zeros > 0:
+            return u64(M) * u64(LN_Q16[M] - LN_Q16[zeros]) // 65536
+        return raw
+
+# The number of bits of `x`, for sizes of sketches.
+def bit_count(x: usize) -> usize:
+    n: usize = 0
+    v = x
+    @bounded(64)
+    while v != 0:
+        n += 1
+        v = v >> 1
+    return n

@@ -1,0 +1,124 @@
+# Packet programs: contexts, actions and protocol headers.
+#
+# Headers are `@network_order`: their integer fields are big-endian in the
+# packet and read in host order. `ctx.parse[Header](offset)` returns a
+# reference to the header at `offset` bytes into the packet, or `None` if
+# the packet is too short; the bounds check is the one the verifier wants.
+# Headers end within the first 65535 bytes (`MAX_PACKET_OFF` of Linux):
+# beyond, `parse` returns `None` too.
+
+@context("xdp")
+struct XdpContext:
+    pass
+
+@context("tc")
+struct TcContext:
+    pass
+
+# The verdicts of an XDP program, in the order of the kernel's values.
+enum XdpAction:
+    ABORTED
+    DROP
+    PASS
+    TX
+    REDIRECT
+
+# The verdicts of a TC program (`TC_ACT_*`), in the order of their values.
+enum TcAction:
+    OK
+    RECLASSIFY
+    SHOT
+    PIPE
+    STOLEN
+    QUEUED
+    REPEAT
+    REDIRECT
+
+# A byte of the packet: `ctx.parse[Byte](offset)?.value`.
+struct Byte:
+    value: u8
+
+const ETH_HLEN: u32 = 14
+const ETH_P_IP: u16 = 0x0800
+const ETH_P_ARP: u16 = 0x0806
+const ETH_P_IPV6: u16 = 0x86DD
+
+const IPPROTO_ICMP: u8 = 1
+const IPPROTO_TCP: u8 = 6
+const IPPROTO_UDP: u8 = 17
+const IPPROTO_ICMPV6: u8 = 58
+
+const IPV6_HLEN: u32 = 40
+const UDP_HLEN: u32 = 8
+
+@network_order
+struct EthHdr:
+    dst: bytes[6]
+    src: bytes[6]
+    proto: u16
+
+@network_order
+struct Ipv4Hdr:
+    version_ihl: u8
+    tos: u8
+    total_len: u16
+    id: u16
+    frag_off: u16
+    ttl: u8
+    protocol: u8
+    check: u16
+    saddr: u32
+    daddr: u32
+
+    def version(self) -> u8:
+        return self.version_ihl >> 4
+
+    # The length of the header in bytes, options included.
+    def header_len(self) -> u32:
+        return u32(self.version_ihl & 0x0F) * 4
+
+@network_order
+struct Ipv6Hdr:
+    version_flow: u32
+    payload_len: u16
+    nexthdr: u8
+    hop_limit: u8
+    saddr: bytes[16]
+    daddr: bytes[16]
+
+@network_order
+struct TcpHdr:
+    sport: u16
+    dport: u16
+    seq: u32
+    ack_seq: u32
+    offset_flags: u16
+    window: u16
+    check: u16
+    urg_ptr: u16
+
+    # The length of the header in bytes, options included.
+    def header_len(self) -> u32:
+        return u32(self.offset_flags >> 12) * 4
+
+    def fin(self) -> bool:
+        return self.offset_flags & 0x01 != 0
+
+    def syn(self) -> bool:
+        return self.offset_flags & 0x02 != 0
+
+    def rst(self) -> bool:
+        return self.offset_flags & 0x04 != 0
+
+    def psh(self) -> bool:
+        return self.offset_flags & 0x08 != 0
+
+    def ack(self) -> bool:
+        return self.offset_flags & 0x10 != 0
+
+@network_order
+struct UdpHdr:
+    sport: u16
+    dport: u16
+    len: u16
+    check: u16

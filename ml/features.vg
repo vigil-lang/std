@@ -1,0 +1,72 @@
+# Statistics of packet streams, updated packet by packet in fixed point:
+# the features of flow classifiers.
+from std.fixed import fixed
+
+# The number of bits of `x`: 0 for 0, 1 for 1, 2 for 2 and 3, ... 64.
+def bit_length(x: u64) -> u64:
+    n: u64 = 0
+    v = x
+    shifts: u64[6] = [32, 16, 8, 4, 2, 1]
+    for shift in shifts:
+        if v >> shift != 0:
+            v = v >> shift
+            n += shift
+    if v != 0:
+        n += 1
+    return n
+
+# The mean and variance of a stream (Welford's algorithm).
+struct Welford[I: usize, F: usize]:
+    count: u64
+    mean: fixed[I, F]
+    m2: fixed[I, F]
+
+    def zero() -> Welford[I, F]:
+        return Welford[I, F](0, fixed[I, F].zero(), fixed[I, F].zero())
+
+    @mut
+    def add(self, x: fixed[I, F]):
+        self.count += 1
+        delta = x - self.mean
+        self.mean = self.mean + delta / fixed[I, F].saturate(self.count)
+        self.m2 = self.m2 + delta * (x - self.mean)
+
+    # The sample variance; zero before two values.
+    def variance(self) -> fixed[I, F]:
+        if self.count < 2:
+            return fixed[I, F].zero()
+        return self.m2 / fixed[I, F].saturate(self.count - 1)
+
+# Counts by powers of two: bucket b counts the values of `b` bits (bucket 0
+# the zeros), the last bucket everything longer.
+struct Log2Histogram[B: usize]:
+    counts: u64[B]
+
+    @mut
+    def add(self, value: u64):
+        self.counts[min(bit_length(value), u64(B - 1))] += 1
+
+# Counts, duration, inter-arrival times and packet sizes of a flow.
+struct FlowFeatures[I: usize, F: usize]:
+    pkts: u64
+    bytes: u64
+    first_ns: u64
+    last_ns: u64
+    iat_us: Welford[I, F]      # between packets, in microseconds
+    size: Welford[I, F]        # of packets, in bytes
+
+    def start(now: u64) -> FlowFeatures[I, F]:
+        return FlowFeatures[I, F](0, 0, now, now, Welford[I, F].zero(), Welford[I, F].zero())
+
+    # Accounts for a packet of `length` bytes seen at `now` (nanoseconds).
+    @mut
+    def update(self, length: u64, now: u64):
+        if self.pkts > 0:
+            self.iat_us.add(fixed[I, F].saturate((now - self.last_ns) // 1000))
+        self.pkts += 1
+        self.bytes += length
+        self.last_ns = now
+        self.size.add(fixed[I, F].saturate(length))
+
+    def duration_us(self) -> u64:
+        return (self.last_ns - self.first_ns) // 1000

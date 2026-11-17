@@ -1,0 +1,118 @@
+# Vectors and matrices with static shapes, over integers or fixed-point
+# numbers (`std.fixed`): any `T` with `+`, `-`, `*` and comparisons.
+#
+# Shapes are generic arguments, so a product of incompatible shapes is a
+# type error. Every loop has a constant bound. Zero is computed as `x - x`,
+# which works for every numeric `T`.
+
+struct Vector[T, N: usize]:
+    items: T[N]
+
+    # A vector of `N` copies of `value`.
+    def fill(value: T) -> Vector[T, N]:
+        return Vector[T, N]([value] * N)
+
+    def len(self) -> usize:
+        return N
+
+    def get(self, i: usize) -> T:
+        return self.items[i]
+
+    def __add__(self, other: Vector[T, N]) -> Vector[T, N]:
+        out = self.items
+        for i in range(N):
+            out[i] = self.items[i] + other.items[i]
+        return Vector[T, N](out)
+
+    def __sub__(self, other: Vector[T, N]) -> Vector[T, N]:
+        out = self.items
+        for i in range(N):
+            out[i] = self.items[i] - other.items[i]
+        return Vector[T, N](out)
+
+    # The element-wise product.
+    def __mul__(self, other: Vector[T, N]) -> Vector[T, N]:
+        out = self.items
+        for i in range(N):
+            out[i] = self.items[i] * other.items[i]
+        return Vector[T, N](out)
+
+    def scale(self, k: T) -> Vector[T, N]:
+        out = self.items
+        for i in range(N):
+            out[i] = self.items[i] * k
+        return Vector[T, N](out)
+
+    def dot(self, other: Vector[T, N]) -> T:
+        total = self.items[0] * other.items[0]
+        for i in range(1, N):
+            total = total + self.items[i] * other.items[i]
+        return total
+
+    def sum(self) -> T:
+        total = self.items[0]
+        for i in range(1, N):
+            total = total + self.items[i]
+        return total
+
+    def max(self) -> T:
+        best = self.items[0]
+        for i in range(1, N):
+            if self.items[i] > best:
+                best = self.items[i]
+        return best
+
+    # The index of the largest element (the first one on ties).
+    def argmax(self) -> usize:
+        best: usize = 0
+        for i in range(1, N):
+            if self.items[i] > self.items[best]:
+                best = i
+        return best
+
+    # `max(x, 0)` element-wise.
+    def relu(self) -> Vector[T, N]:
+        out = self.items
+        for i in range(N):
+            zero = self.items[i] - self.items[i]
+            if self.items[i] < zero:
+                out[i] = zero
+        return Vector[T, N](out)
+
+    # The square of the Euclidean distance.
+    def distance2(self, other: Vector[T, N]) -> T:
+        d = self - other
+        return d.dot(d)
+
+struct Matrix[T, R: usize, C: usize]:
+    rows: T[C][R]
+
+    def row(self, i: usize) -> Vector[T, C]:
+        return Vector[T, C](self.rows[i])
+
+    def get(self, i: usize, j: usize) -> T:
+        return self.rows[i][j]
+
+    # The product by a column vector: shapes `R x C` and `C`.
+    def matvec(self, x: Vector[T, C]) -> Vector[T, R]:
+        out = [x.items[0]] * R
+        for i in range(R):
+            total = self.rows[i][0] * x.items[0]
+            for j in range(1, C):
+                total = total + self.rows[i][j] * x.items[j]
+            out[i] = total
+        return Vector[T, R](out)
+
+    def transpose(self) -> Matrix[T, C, R]:
+        out = [[self.rows[0][0]] * R] * C
+        for i in range(R):
+            for j in range(C):
+                out[j][i] = self.rows[i][j]
+        return Matrix[T, C, R](out)
+
+# The index of the largest element of a vector.
+def argmax[T, N: usize](v: Vector[T, N]) -> usize:
+    return v.argmax()
+
+def relu[T, N: usize](v: Vector[T, N]) -> Vector[T, N]:
+    return v.relu()

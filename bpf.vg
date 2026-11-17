@@ -1,0 +1,57 @@
+# Contexts and helpers of tracing programs.
+#
+# A context is the argument the kernel passes to a program; it cannot be
+# constructed. Helpers are kernel functions called by number; their bodies
+# are `...` because the kernel implements them.
+
+@context("kprobe")
+struct KprobeContext:
+    pass
+
+@context("tracepoint")
+struct TracepointContext:
+    pass
+
+# The arguments of an LSM hook: `ctx.arg(n)` is the n-th, as a 64-bit word.
+@context("lsm")
+struct LsmContext:
+    pass
+
+# The thread group id (the process id) in the upper 32 bits and the thread id
+# in the lower 32 bits. `bpf_get_current_pid_tgid`.
+@helper(14)
+def pid_tgid() -> u64: ...
+
+# The group id in the upper 32 bits and the user id in the lower 32 bits.
+# `bpf_get_current_uid_gid`.
+@helper(15)
+def uid_gid() -> u64: ...
+
+# Nanoseconds since boot, not counting suspend. `bpf_ktime_get_ns`.
+@helper(5)
+def ktime_ns() -> u64: ...
+
+# The CPU running the program. `bpf_get_smp_processor_id`.
+@helper(8)
+def smp_processor_id() -> u32: ...
+
+# The name of the current task, NUL-padded. `bpf_get_current_comm`.
+@helper(16)
+def comm() -> bytes[16]: ...
+
+# The address of the current `task_struct`. `bpf_get_current_task`.
+@helper(35)
+def current_task() -> u64: ...
+
+# The string at a user-space address, NUL-terminated and truncated to fit.
+# `bpf_probe_read_user_str`.
+@helper(114)
+def read_user_str(address: u64) -> bytes[128]: ...
+
+# The string at a kernel address. `bpf_probe_read_kernel_str`.
+@helper(115)
+def read_kernel_str(address: u64) -> bytes[128]: ...
+
+# A pseudo-random number. `bpf_get_prandom_u32`.
+@helper(7)
+def prandom_u32() -> u32: ...
